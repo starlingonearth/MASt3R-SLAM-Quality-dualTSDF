@@ -91,6 +91,58 @@ class FrameTracker:
         except Exception as e:
             print(f"Cholesky failed {frame.frame_id}")
             return False, [], True
+        
+        # 新增: 质量评估部分 (lines 94-140)
+        # 质量评估
+        if hasattr(self, "quality_service") and (self.quality_service is not None):
+            print(f"DEBUG: Processing quality for keyframe {keyframe.frame_id}")
+            try:
+                with torch.no_grad():
+                    if config["use_calib"]:
+                        # 标定模式: 计算像素和深度残差
+                        Xf_Ck = act_Sim3(T_CkCf, Xf, jacobian=False)
+                        pzf_Ck, valid_proj = project_calib(Xf_Ck, K, img_size)
+                        du = (meas_k[..., 0] - pzf_Ck[..., 0])
+                        dv = (meas_k[..., 1] - pzf_Ck[..., 1])
+                        dz = (meas_k[..., 2] - pzf_Ck[..., 2])
+                        lam = (self.cfg["sigma_pixel"] ** 2) / (self.cfg["sigma_depth"] ** 2 + 1e-8)
+                        r_pix = torch.sqrt(du * du + dv * dv + lam * dz * dz)
+                        valid_submit = (valid_kf & valid_proj & valid_meas_k).view(-1)
+                    else:
+                        # 非标定模式: 计算射线距离残差
+                        Xf_Ck = act_Sim3(T_CkCf, Xf, jacobian=False)
+                        rd_k = point_to_ray_dist(Xk, jacobian=False)
+                        rd_f = point_to_ray_dist(Xf_Ck, jacobian=False)
+                        r_pix = torch.linalg.norm(rd_k - rd_f, dim=1)
+                        valid_submit = valid_kf.view(-1)
+
+                    # 提取位姿参数用于质量指标
+                    vec = T_CkCf.data.view(-1, 8)
+                    t = vec[..., :3]
+                    q = vec[..., 3:7]
+                    w = q[..., -1].clamp(-1.0, 1.0).abs()
+                    theta = 2.0 * torch.arccos(w)
+                    t_norm = t.norm(dim=-1)
+
+                    # 提交质量任务，包含关键帧和帧 ID
+                    current_kf_id = len(self.keyframes) - 1
+                    job = {
+                        "kf_id": int(current_kf_id),  # 关键帧索引
+                        "frame_id": int(keyframe.frame_id),  # 原始帧 ID
+                        "H": int(img_size[0]),
+                        "W": int(img_size[1]),
+                        "valid_kf": valid_submit.cpu().numpy(),
+                        "r_pix": r_pix.view(-1).cpu().numpy(),
+                        "Ck": Ck.view(-1).cpu().numpy(),
+                        "Qk": Qk.view(-1).cpu().numpy(),
+                        "t_norm": float(t_norm.mean().item()),
+                        "theta": float(theta.mean().item()),
+                    }
+                    self.quality_service.submit(job)
+            except Exception as e:
+                print(f"ERROR in quality submission: {e}")
+                import traceback
+                traceback.print_exc()
 
         frame.T_WC = T_WCf
 
@@ -159,14 +211,14 @@ class FrameTracker:
             huber(whitened_r, k=self.cfg["huber"])
         )
         mdim = J.shape[-1]
-        A = (robust_sqrt_info[..., None] * J).view(-1, mdim)  # dr_dX
-        b = (robust_sqrt_info * r).view(-1, 1)  # z-h
+        A = (robust_sqrt_info[..., None] * J).view(-1, mdim)
+        b = (robust_sqrt_info * r).view(-1, 1)
         H = A.T @ A
         g = -A.T @ b
         cost = 0.5 * (b.T @ b).item()
 
-        L = torch.linalg.cholesky(H, upper=False)
-        tau_j = torch.cholesky_solve(g, L, upper=False).view(1, -1)
+        # 新增: 修改的 Cholesky 求解 (line 215)
+        tau_j = torch.cholesky_solve(g, torch.linalg.cholesky(H)).view(1, -1)
 
         return tau_j, cost
 
@@ -176,7 +228,7 @@ class FrameTracker:
         sqrt_info_dist = 1 / self.cfg["sigma_dist"] * valid * torch.sqrt(Qk)
         sqrt_info = torch.cat((sqrt_info_ray.repeat(1, 3), sqrt_info_dist), dim=1)
 
-        # Solving for relative pose without scale!
+        # Solving for relative pose
         T_CkCf = T_WCk.inv() * T_WCf
 
         # Precalculate distance and ray for obs k
@@ -221,7 +273,7 @@ class FrameTracker:
         sqrt_info_depth = 1 / self.cfg["sigma_depth"] * valid * torch.sqrt(Qk)
         sqrt_info = torch.cat((sqrt_info_pixel.repeat(1, 2), sqrt_info_depth), dim=1)
 
-        # Solving for relative pose without scale!
+        # Solving for relative pose
         T_CkCf = T_WCk.inv() * T_WCf
 
         old_cost = float("inf")

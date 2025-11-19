@@ -22,8 +22,8 @@ from mast3r_slam.mast3r_utils import (
 from mast3r_slam.multiprocess_utils import new_queue, try_get_msg
 from mast3r_slam.tracker import FrameTracker
 from mast3r_slam.visualization import WindowMsg, run_visualization
+from mast3r_slam.quality import AsynchronousQualityService  # 新增: 导入质量服务
 import torch.multiprocessing as mp
-
 
 def relocalization(frame, keyframes, factor_graph, retrieval_database):
     # we are adding and then removing from the keyframe, so we need to be careful.
@@ -70,13 +70,24 @@ def relocalization(frame, keyframes, factor_graph, retrieval_database):
                 factor_graph.solve_GN_rays()
         return successful_loop_closure
 
-
-def run_backend(cfg, model, states, keyframes, K):
+def run_backend(cfg, model, states, keyframes, K, tsdf_global_cfg):  # 新增: 添加 tsdf_global_cfg 参数
     set_global_config(cfg)
 
     device = keyframes.device
     factor_graph = FactorGraph(model, keyframes, K, device)
     retrieval_database = load_retriever(model)
+    # 新增: TSDF 全局管理器初始化 (lines 78-88)
+    tsdf_manager = None
+    if tsdf_global_cfg.get("enabled", False):
+        from mast3r_slam.tsdf import TSDFGlobalManager
+
+        tsdf_manager = TSDFGlobalManager(
+            keyframes=keyframes,
+            cfg=tsdf_global_cfg,
+            use_calib=config.get("use_calib", False),
+            device=device,
+        )
+        tsdf_manager.start()
 
     mode = states.get_mode()
     while mode is not Mode.TERMINATED:
@@ -137,11 +148,19 @@ def run_backend(cfg, model, states, keyframes, K):
         else:
             factor_graph.solve_GN_rays()
 
+        # 新增: TSDF 全局管理器求解后回调 (lines 149-153)
+        if tsdf_manager is not None:
+            try:
+                tsdf_manager.on_after_backend_solve(factor_graph)
+            except Exception as exc:
+                print(f"[TSDF-GLOBAL] Optimization failed: {exc}")
+
         with states.lock:
             if len(states.global_optimizer_tasks) > 0:
                 idx = states.global_optimizer_tasks.pop(0)
-
-
+    # 新增: TSDF 全局管理器关闭 (lines 158-159)
+    if tsdf_manager is not None:
+        tsdf_manager.shutdown()
 if __name__ == "__main__":
     mp.set_start_method("spawn")
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -156,7 +175,6 @@ if __name__ == "__main__":
     parser.add_argument("--save-as", default="default")
     parser.add_argument("--no-viz", action="store_true")
     parser.add_argument("--calib", default="")
-
     args = parser.parse_args()
 
     load_config(args.config)
@@ -166,6 +184,8 @@ if __name__ == "__main__":
     manager = mp.Manager()
     main2viz = new_queue(manager, args.no_viz)
     viz2main = new_queue(manager, args.no_viz)
+    # 新增: 异步质量服务初始化 (line 183)
+    quality_service = AsynchronousQualityService(manager=manager)
 
     dataset = load_dataset(args.dataset)
     dataset.subsample(config["dataset"]["subsample"])
@@ -221,20 +241,93 @@ if __name__ == "__main__":
 
     tracker = FrameTracker(model, keyframes, device)
     last_msg = WindowMsg()
+    # 新增: 将质量服务附加到跟踪器 (line 243)
+    # 注释: 将质量服务附加到跟踪器
+    tracker.quality_service = quality_service
 
-    backend = mp.Process(target=run_backend, args=(config, model, states, keyframes, K))
+    # 新增: TSDF 精化器初始化部分 (lines 245-284)
+    # 注释: TSDF 精化器初始化
+    # ------------------------------
+    # TSDF Refiner initialization
+    # ------------------------------
+    tsdf_refiner = None
+    tsdf_enabled = config.get("tsdf_refine", {}).get("enabled", False)
+    tsdf_cfg = config.get("tsdf_refine", {})
+
+    # Shutdown parameters (can be overridden in config)
+    MAX_SHUTDOWN_WAIT_S  = float(tsdf_cfg.get("max_shutdown_wait_s", -1.0))  # <=0  unlimited
+    MIN_SHUTDOWN_WAIT_S  = float(tsdf_cfg.get("min_shutdown_wait_s", 0.0))
+    DEFAULT_BLOCK_TIME_S = float(tsdf_cfg.get("default_block_time_s", 12.0))
+    PROGRESS_STALL_S     = float(tsdf_cfg.get("progress_stall_s", 45.0))
+    GRACE_EMPTY_S        = float(tsdf_cfg.get("grace_empty_s", 3.0))
+
+    UNLIMITED_WAIT = MAX_SHUTDOWN_WAIT_S <= 0
+
+    if tsdf_enabled:
+        print("[MAIN] Initializing TSDF Refiner...")
+        print(f"[MAIN] TSDF config: {tsdf_cfg}")
+        try:
+            from mast3r_slam.tsdf_refine import TSDFRefiner
+            tsdf_refiner = TSDFRefiner(
+                cfg=tsdf_cfg,
+                shared_keyframes=keyframes,
+                quality_service=quality_service,
+                device=device,
+            )
+            tsdf_refiner.start()
+            if tsdf_refiner.is_alive():
+                print("[MAIN] TSDF refiner thread started successfully")
+            else:
+                print("[MAIN] WARNING: TSDF refiner thread failed to start")
+                tsdf_refiner = None
+        except Exception as e:
+            print(f"[MAIN] Failed to initialize TSDF refiner: {e}")
+            import traceback
+            traceback.print_exc()
+            tsdf_refiner = None
+    else:
+        print("[MAIN] TSDF refinement disabled in config")
+
+    # 新增: 后端进程现在包含 TSDF 全局配置参数 (lines 282-293)
+    backend = mp.Process(
+        target=run_backend,
+        args=(
+            config,
+            model,
+            states,
+            keyframes,
+            K,
+            config.get("tsdf_global", {}),  # 新增: TSDF 全局配置
+        ),
+    )
     backend.start()
 
+    # 新增: 主循环部分，包含 TSDF 跟踪变量 (lines 304-322)
+    # ------------------------------
+    # Main loop
+    # ------------------------------
     i = 0
     fps_timer = time.time()
-
     frames = []
 
+    tsdf_total_scheduled = 0
+    tsdf_last_success_count = 0
+    tsdf_shutdown_in_progress = False  # prevent scheduling during shutdown
+    final_pass_scheduled_once = False  # idempotency guard
+
+    def _queue_size_safe(refiner):
+        try:
+            return refiner.queue.qsize()
+        except Exception:
+            return None
+
+    print("Starting main processing loop...")
     while True:
         mode = states.get_mode()
         msg = try_get_msg(viz2main)
         last_msg = msg if msg is not None else last_msg
         if last_msg.is_terminated:
+            print("Termination requested")
             states.set_mode(Mode.TERMINATED)
             break
 
@@ -247,6 +340,7 @@ if __name__ == "__main__":
             states.unpause()
 
         if i == len(dataset):
+            print(f"Processed all {len(dataset)} frames")
             states.set_mode(Mode.TERMINATED)
             break
 
@@ -254,7 +348,7 @@ if __name__ == "__main__":
         if save_frames:
             frames.append(img)
 
-        # get frames last camera pose
+        # last camera pose for the frame
         T_WC = (
             lietorch.Sim3.Identity(1, device=device)
             if i == 0
@@ -263,7 +357,6 @@ if __name__ == "__main__":
         frame = create_frame(i, img, T_WC, img_size=dataset.img_size, device=device)
 
         if mode == Mode.INIT:
-            # Initialize via mono inference, and encoded features neeed for database
             X_init, C_init = mast3r_inference_mono(model, frame)
             frame.update_pointmap(X_init, C_init)
             keyframes.append(frame)
@@ -284,7 +377,7 @@ if __name__ == "__main__":
             frame.update_pointmap(X, C)
             states.set_frame(frame)
             states.queue_reloc()
-            # In single threaded mode, make sure relocalization happen for every frame
+            # 新增: 单线程模式等待重定位 (lines 378-382)
             while config["single_thread"]:
                 with states.lock:
                     if states.reloc_sem.value == 0:
@@ -297,39 +390,229 @@ if __name__ == "__main__":
         if add_new_kf:
             keyframes.append(frame)
             states.queue_global_optimization(len(keyframes) - 1)
-            # In single threaded mode, wait for the backend to finish
+
+            # 新增: 单线程模式等待后端 (lines 391-395)
             while config["single_thread"]:
                 with states.lock:
                     if len(states.global_optimizer_tasks) == 0:
                         break
                 time.sleep(0.01)
-        # log time
+
+            # 新增: TSDF 精化调度逻辑 (lines 397-416)
+            # 仅在未关闭且精化器健康时调度 TSDF 精化
+            sf = getattr(tsdf_refiner, "stop_flag", None)
+            if (
+                tsdf_refiner is not None
+                and tsdf_refiner.is_alive()
+                and not tsdf_shutdown_in_progress
+                and not (sf is not None and sf.is_set())
+            ):
+                current_kf_id = len(keyframes) - 1
+                old_queue_size = _queue_size_safe(tsdf_refiner)
+                try:
+                    tsdf_refiner.maybe_schedule_sliding_window(current_kf_id)
+                except Exception as e:
+                    print(f"[TSDF] Scheduling error: {e}")
+                new_queue_size = _queue_size_safe(tsdf_refiner)
+                if old_queue_size is not None and new_queue_size is not None:
+                    if new_queue_size > old_queue_size:
+                        blocks_added = new_queue_size - old_queue_size
+                        tsdf_total_scheduled += blocks_added
+                        print(f"[TSDF] Scheduled {blocks_added} blocks for keyframe {current_kf_id}")
+
+        # 新增: 增强的状态日志，包含 TSDF 统计信息 (lines 418-438)
         if i % 30 == 0:
-            FPS = i / (time.time() - fps_timer)
-            print(f"FPS: {FPS}")
+            FPS = i / (time.time() - fps_timer + 1e-6)
+            status_msg = f"[STATUS] Frame {i}, FPS: {FPS:.2f}"
+
+            if tsdf_refiner is not None and tsdf_refiner.is_alive():
+                try:
+                    stats = tsdf_refiner.stats
+                    success_count = stats.get("successful_blocks", 0)
+                    total_count = stats.get("total_blocks", 0)
+                    qsz = _queue_size_safe(tsdf_refiner)
+                    if success_count > tsdf_last_success_count:
+                        tsdf_last_success_count = success_count
+                        print(f"[TSDF] New successes! Total: {success_count}")
+                    if total_count > 0:
+                        success_rate = success_count / max(1, total_count)
+                        qinfo = f", Queue: {qsz}" if qsz is not None else ""
+                        status_msg += f", TSDF: {success_count}/{total_count} ({success_rate:.1%}){qinfo}"
+                except Exception:
+                    pass
+
+            print(status_msg)
+
         i += 1
 
+    print(f"\nMain loop completed. Processed {i} frames.")
+
+    # 新增: TSDF 精化器关闭部分 (lines 444-557)
+    # ------------------------------
+    # TSDF shutdown: schedule final pass drain queue until empty  print stats  stop
+    # ------------------------------
+    if tsdf_refiner is not None:
+        tsdf_shutdown_in_progress = True  # block any further scheduling
+
+        print("\n" + "=" * 60)
+        print("TSDF REFINER SHUTDOWN")
+        print("=" * 60)
+        try:
+            # (1) schedule final pass once
+            if len(keyframes) > 0 and not final_pass_scheduled_once:
+                final_kf_id = len(keyframes) - 1
+                print(f"[TSDF] Triggering final pass for {final_kf_id} keyframes...")
+                try:
+                    tsdf_refiner.schedule_final_pass(final_kf_id)
+                except Exception as e:
+                    print(f"[TSDF] schedule_final_pass error: {e}")
+                final_pass_scheduled_once = True
+
+            # (2) drain until queue is empty (time-unlimited if configured)
+            #     we also allow a tiny grace to cover the last in-flight block after qsize hits zero
+            start = time.time()
+            last_report = start
+            last_success = int(getattr(tsdf_refiner, "stats", {}).get("successful_blocks", 0))
+
+            if MIN_SHUTDOWN_WAIT_S > 0:
+                time.sleep(MIN_SHUTDOWN_WAIT_S)
+
+            while True:
+                qsz = _queue_size_safe(tsdf_refiner)
+                stats = getattr(tsdf_refiner, "stats", {}) or {}
+                success = int(stats.get("successful_blocks", 0))
+
+                # periodic progress print
+                if time.time() - last_report >= 5.0:
+                    print(f"[TSDF] Draining... queue={qsz}, successes={success}")
+                    last_report = time.time()
+
+                # if queue size known and empty, give a short grace and break
+                if qsz is not None and qsz == 0:
+                    # if success increased right at empty, refresh timer
+                    if success > last_success:
+                        last_success = success
+                        last_report = time.time()
+                    # grace for last in-flight block to write back
+                    time.sleep(GRACE_EMPTY_S)
+                    # re-check: still empty?
+                    qsz2 = _queue_size_safe(tsdf_refiner)
+                    if qsz2 == 0:
+                        print("[TSDF] Queue drained.")
+                        break
+
+                # if we do NOT know queue size (shouldn't happen with threads), fallback to progress-based wait
+                if qsz is None:
+                    if not UNLIMITED_WAIT and (time.time() - start) >= MAX_SHUTDOWN_WAIT_S:
+                        print("[TSDF] Reached shutdown wait budget (fallback path).")
+                        break
+                    # keep waiting as long as progress happens within PROGRESS_STALL_S
+                    time.sleep(0.5)
+                    if success > last_success:
+                        last_success = success
+                        last_report = time.time()
+                    elif (time.time() - last_report) >= PROGRESS_STALL_S:
+                        print(f"[TSDF] No progress for {PROGRESS_STALL_S:.1f}s (fallback); assuming drained.")
+                        break
+                else:
+                    # known queue size and not empty: keep waiting (unlimited if configured)
+                    if not UNLIMITED_WAIT and (time.time() - start) >= MAX_SHUTDOWN_WAIT_S:
+                        print("[TSDF] Reached shutdown wait budget.")
+                        break
+                    time.sleep(0.5)
+
+            # (3) final statistics
+            if hasattr(tsdf_refiner, "stats"):
+                stats = tsdf_refiner.stats
+                success_count = stats.get("successful_blocks", 0)
+                total_count = stats.get("total_blocks", 0)
+                print(f"[TSDF] Final Statistics:")
+                print(f"  - Total blocks processed: {total_count}")
+                print(f"  - Successful refinements: {success_count}")
+                if total_count > 0:
+                    success_rate = success_count / max(1, total_count)
+                    avg_time = stats.get("total_processing_time", 0.0) / max(1, total_count)
+                    print(f"  - Success rate: {success_rate:.1%}")
+                    print(f"  - Average time per block: {avg_time:.3f}s")
+                debug_info = stats.get("debug_info", {}) or {}
+                print(f"  - TSDF constructions: {debug_info.get('tsdf_constructions', 0)}")
+                print(f"  - Surface extractions: {debug_info.get('surface_extractions', 0)}")
+                print(f"  - Displacement rejects: {debug_info.get('displacement_rejects', 0)}")
+                print(f"  - Hit ratio rejects: {debug_info.get('hit_ratio_rejects', 0)}")
+
+            # (4) stop thread
+            print("[TSDF] Stopping refiner thread...")
+            try:
+                tsdf_refiner.stop_flag.set()
+            except Exception:
+                pass
+            # unlimited join if unlimited wait requested
+            tsdf_refiner.join(timeout=None if UNLIMITED_WAIT else 60.0)
+            if tsdf_refiner.is_alive():
+                print("[TSDF] WARNING: Thread did not stop cleanly")
+            else:
+                print("[TSDF] Shutdown completed successfully")
+
+            # (5) summary
+            if hasattr(tsdf_refiner, "stats"):
+                final_success = tsdf_refiner.stats.get("successful_blocks", 0)
+                if final_success > 0:
+                    print(f"[TSDF] ? Successfully refined {final_success} blocks!")
+                else:
+                    print("[TSDF] No successful refinements in this run")
+
+        except Exception as e:
+            print(f"[TSDF] Shutdown error: {e}")
+            import traceback
+            traceback.print_exc()
+
+        print("=" * 60)
+
+    # 新增: 增强的保存结果部分，包含质量 PLY 导出 (lines 570-593)
+    # ------------------------------
+    # Save results
+    # ------------------------------
     if dataset.save_results:
+        print("\nSaving results...")
         save_dir, seq_name = eval.prepare_savedir(args, dataset)
         eval.save_traj(save_dir, f"{seq_name}.txt", dataset.timestamps, keyframes)
         eval.save_reconstruction(
             save_dir,
             f"{seq_name}.ply",
             keyframes,
-            last_msg.C_conf_threshold,
+            0.0,  # 新增: 从 last_msg.C_conf_threshold 改为 0.0
+        )
+        # 新增: 保存带质量属性的 PLY (lines 583-589)
+        eval.save_ply_with_quality(
+            save_dir,
+            f"{seq_name}_quality.ply",
+            keyframes,
+            0.0,
+            quality_service,
         )
         eval.save_keyframes(
             save_dir / "keyframes" / seq_name, dataset.timestamps, keyframes
         )
+        print(f"Results saved to {save_dir}")
+
     if save_frames:
+        print("Saving frames...")
         savedir = pathlib.Path(f"logs/frames/{datetime_now}")
         savedir.mkdir(exist_ok=True, parents=True)
         for i, frame in tqdm.tqdm(enumerate(frames), total=len(frames)):
             frame = (frame * 255).clip(0, 255)
             frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
             cv2.imwrite(f"{savedir}/{i}.png", frame)
+        print(f"Frames saved to {savedir}")
 
-    print("done")
+    # 新增: 增强的关闭序列，包含质量服务 (lines 605-614)
+    print("\nShutting down services...")
+    quality_service.shutdown()
     backend.join()
+
     if not args.no_viz:
         viz.join()
+
+    print("\n" + "=" * 60)
+    print("ALL PROCESSES SHUTDOWN COMPLETE")
+    print("=" * 60)

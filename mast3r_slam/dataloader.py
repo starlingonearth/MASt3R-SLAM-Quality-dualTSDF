@@ -6,6 +6,8 @@ import numpy as np
 import torch
 import pyrealsense2 as rs
 import yaml
+import json  # 新增: 用于 ReplicaDataset cam_params.json 解析
+import os    # 新增: 用于 load_dataset 路径扩展名处理
 
 from mast3r_slam.mast3r_utils import resize_img
 from mast3r_slam.config import config
@@ -40,7 +42,7 @@ class MonocularDataset(torch.utils.data.Dataset):
         return self.timestamps[idx]
 
     def read_img(self, idx):
-        img = cv2.imread(self.rgb_files[idx])
+        img = cv2.imread(str(self.rgb_files[idx]))  # 新增: 添加 str() 以兼容 pathlib
         return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
     def get_image(self, idx):
@@ -112,7 +114,7 @@ class EurocDataset(MonocularDataset):
         )
 
     def read_img(self, idx):
-        img = cv2.imread(self.rgb_files[idx], cv2.IMREAD_GRAYSCALE)
+        img = cv2.imread(str(self.rgb_files[idx]), cv2.IMREAD_GRAYSCALE)  # 新增: 添加 str() 以兼容 pathlib
         return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
 
 
@@ -273,6 +275,203 @@ class RGBFiles(MonocularDataset):
         self.rgb_files = natsorted(list((self.dataset_path).glob("*.png")))
         self.timestamps = np.arange(0, len(self.rgb_files)).astype(self.dtype) / 30.0
 
+# 新增: ReplicaDataset 类 (lines 275-468)
+class ReplicaDataset(MonocularDataset):
+    """
+    Dataset adapter for the Replica layout:
+
+        <...>/datasets/Replica/
+          cam_params.json
+          office0/
+            results/
+              frame000000.jpg
+              frame000001.jpg
+              ...
+              depth000000.png
+              ...
+            traj.txt  # optional (first column = timestamp)
+          office1/
+          room0/
+          ...
+
+    Notes:
+    - Only color frames are used (frame*.jpg / frame*.png). Depth files are ignored.
+    - Timestamps: prefer traj.txt first column; otherwise synthesize 30 FPS.
+    - Intrinsics: try cam_params.json (supports multiple key layouts). If not
+      available, a safe default is used (f ~ 0.9*W, cx = W/2, cy = H/2).
+    """
+
+    def __init__(self, dataset_path: str):
+        super().__init__()
+        self.dataset_path = pathlib.Path(dataset_path)
+
+        # -------- 1) Resolve image directory --------
+        img_dir = self.dataset_path / "results"
+        if not img_dir.is_dir():
+            if self.dataset_path.name.lower() == "results":
+                img_dir = self.dataset_path
+            else:
+                img_dir = self.dataset_path  # fallback: allow pointing to sequence root
+
+        # Prefer results/color or results/rgb if they exist
+        candidate_dirs = []
+        for sub in ("color", "rgb"):
+            p = img_dir / sub
+            if p.is_dir():
+                candidate_dirs.append(p)
+        candidate_dirs.append(img_dir)
+
+        # -------- 2) Collect COLOR images only (exclude depth) --------
+        # Accept frame*.jpg/jpeg/png (case-insensitive). Do NOT grab generic *.png
+        # to avoid swallowing depth*.png.
+        patterns = [
+            "frame*.jpg", "frame*.JPG",
+            "frame*.jpeg", "frame*.JPEG",
+            "frame*.png", "frame*.PNG",
+        ]
+
+        rgb_paths = []
+        # Non-recursive first (fast path)
+        for d in candidate_dirs:
+            for pat in patterns:
+                rgb_paths += list(d.glob(pat))
+            if rgb_paths:
+                break
+
+        # If nothing found, try recursive search (handles nested layouts)
+        if not rgb_paths:
+            for d in candidate_dirs:
+                for pat in patterns:
+                    rgb_paths += list(d.rglob(pat))
+
+        # Extra safety: exclude anything that looks like depth
+        rgb_paths = [p for p in rgb_paths if "depth" not in p.name.lower()]
+
+        # Deduplicate and natural sort
+        self.rgb_files = [str(p) for p in natsorted(set(rgb_paths))]
+
+
+        if len(self.rgb_files) == 0:
+            raise FileNotFoundError(
+                f"[ReplicaDataset] No RGB frames (frame*.jpg/png) found under {img_dir} (and subdirs)."
+            )
+
+        # -------- 3) Determine image size from the first frame --------
+        img0 = cv2.imread(str(self.rgb_files[0]))
+        if img0 is None:
+            raise RuntimeError(f"[ReplicaDataset] Failed to read image: {self.rgb_files[0]}")
+        H, W = img0.shape[:2]
+
+        # -------- 4) Build timestamps (traj.txt preferred) --------
+        ts = None
+        traj_file = self.dataset_path / "traj.txt"
+        if traj_file.is_file():
+            try:
+                arr = np.loadtxt(str(traj_file), dtype=np.float64)
+                if arr.ndim == 1:
+                    arr = arr.reshape(-1, 1)
+                # Typical layout: ts tx ty tz qx qy qz qw; take the first column
+                if arr.shape[0] >= len(self.rgb_files):
+                    ts = arr[: len(self.rgb_files), 0].astype(self.dtype)
+            except Exception:
+                ts = None
+
+        if ts is None:
+            # Fallback: 30 FPS synthetic timestamps
+            ts = np.arange(len(self.rgb_files), dtype=self.dtype) / 30.0
+
+        self.timestamps = ts
+
+        # -------- 5) Camera intrinsics from cam_params.json (if available) --------
+        cam_json = None
+        for p in (
+            self.dataset_path / "cam_params.json",
+            self.dataset_path.parent / "cam_params.json",
+            self.dataset_path.parent.parent / "cam_params.json",
+        ):
+            if p.exists():
+                cam_json = p
+                break
+
+        fx = fy = cx = cy = None
+        distortion = None
+
+        if cam_json is not None:
+            try:
+                with open(cam_json, "r", encoding="utf-8") as f:
+                    cam = json.load(f)
+                fx, fy, cx, cy, distortion = self._parse_cam_dict(cam)
+                if fx is None and isinstance(cam, dict):
+                    inner = cam.get("camera") or cam.get("rgb") or cam.get("color")
+                    if isinstance(inner, dict):
+                        fx, fy, cx, cy, distortion = self._parse_cam_dict(inner)
+            except Exception:
+                # Keep defaults below if parsing fails
+                pass
+
+        if fx is not None and fy is not None and cx is not None and cy is not None:
+            calib = [float(fx), float(fy), float(cx), float(cy)]
+            if distortion:
+                calib += [float(v) for v in distortion]
+            self.camera_intrinsics = Intrinsics.from_calib(self.img_size, W, H, calib)
+        else:
+            # Safe default if calibration not found. If config.use_calib=False,
+            # the runtime will ignore intrinsics anyway.
+            self.camera_intrinsics = Intrinsics.from_calib(
+                self.img_size, W, H, [0.9 * W, 0.9 * W, W / 2.0, H / 2.0]
+            )
+
+    # -------- helpers --------
+
+    @staticmethod
+    def _parse_cam_dict(d):
+        """
+        Parse common JSON layouts:
+          - {"fx":..., "fy":..., "cx":..., "cy":..., "distortion":[...]} (or k1/k2/p1/p2/k3)
+          - {"intrinsics":[fx, fy, cx, cy], "distortion":[...]}
+          - {"K":[[fx,0,cx],[0,fy,cy],[0,0,1]]} or {"K":[fx,0,cx, 0,fy,cy, 0,0,1]}
+        Returns (fx, fy, cx, cy, distortion_list_or_None), with None on failure.
+        """
+        fx = fy = cx = cy = None
+        dist = None
+
+        if not isinstance(d, dict):
+            return fx, fy, cx, cy, dist
+
+        # Mode 1: separate scalar keys
+        if all(k in d for k in ("fx", "fy", "cx", "cy")):
+            fx, fy, cx, cy = float(d["fx"]), float(d["fy"]), float(d["cx"]), float(d["cy"])
+            if "distortion" in d and isinstance(d["distortion"], (list, tuple)):
+                dist = list(map(float, d["distortion"]))
+            else:
+                ks = []
+                for k in ("k1", "k2", "p1", "p2", "k3"):
+                    if k in d:
+                        ks.append(float(d[k]))
+                dist = ks if ks else None
+            return fx, fy, cx, cy, dist
+
+        # Mode 2: intrinsics vector
+        intr = d.get("intrinsics")
+        if isinstance(intr, (list, tuple)) and len(intr) >= 4:
+            fx, fy, cx, cy = float(intr[0]), float(intr[1]), float(intr[2]), float(intr[3])
+            if "distortion" in d and isinstance(d["distortion"], (list, tuple)):
+                dist = list(map(float, d["distortion"]))
+            return fx, fy, cx, cy, dist
+
+        # Mode 3: K matrix (3x3 or flat-9)
+        K = d.get("K")
+        if isinstance(K, (list, tuple)):
+            if len(K) == 9:
+                fx, fy, cx, cy = float(K[0]), float(K[4]), float(K[2]), float(K[5])
+                return fx, fy, cx, cy, dist
+            if len(K) == 3 and isinstance(K[0], (list, tuple)) and len(K[0]) == 3:
+                fx, fy, cx, cy = float(K[0][0]), float(K[1][1]), float(K[0][2]), float(K[1][2])
+                return fx, fy, cx, cy, dist
+
+        return fx, fy, cx, cy, dist
+
+
 
 class Intrinsics:
     def __init__(self, img_size, W, H, K_orig, K, distortion, mapx, mapy):
@@ -316,23 +515,27 @@ class Intrinsics:
 
         return Intrinsics(img_size, W, H, K, K_opt, distortion, mapx, mapy)
 
+# 新增: 重构的 load_dataset 函数 (lines 514-536)
+def load_dataset(dataset_path: str):
+    tokens = [s.lower() for s in re.split(r'[\\/]+', dataset_path)]
+    # match Replica first
+    if 'replica' in tokens:
+        return ReplicaDataset(dataset_path)
 
-def load_dataset(dataset_path):
-    split_dataset_type = dataset_path.split("/")
-    if "tum" in split_dataset_type:
+    if 'tum' in tokens:
         return TUMDataset(dataset_path)
-    if "euroc" in split_dataset_type:
+    if 'euroc' in tokens:
         return EurocDataset(dataset_path)
-    if "eth3d" in split_dataset_type:
+    if 'eth3d' in tokens:
         return ETH3DDataset(dataset_path)
-    if "7-scenes" in split_dataset_type:
+    if '7-scenes' in tokens or '7scenes' in tokens or '7_scenes' in tokens:
         return SevenScenesDataset(dataset_path)
-    if "realsense" in split_dataset_type:
+    if 'realsense' in tokens:
         return RealsenseDataset()
-    if "webcam" in split_dataset_type:
+    if 'webcam' in tokens:
         return Webcam()
 
-    ext = split_dataset_type[-1].split(".")[-1]
-    if ext in ["mp4", "avi", "MOV", "mov"]:
+    ext = os.path.splitext(dataset_path)[1].lower()
+    if ext in ['.mp4', '.avi', '.mov']:
         return MP4Dataset(dataset_path)
     return RGBFiles(dataset_path)

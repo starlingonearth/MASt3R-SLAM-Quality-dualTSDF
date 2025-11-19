@@ -218,7 +218,7 @@ class SharedStates:
 
 
 class SharedKeyframes:
-    def __init__(self, manager, h, w, buffer=512, dtype=torch.float32, device="cuda"):
+    def __init__(self, manager, h, w, buffer=110, dtype=torch.float32, device="cuda"):  # 新增: 将 buffer 从 512 改为 110
         self.lock = manager.RLock()
         self.n_size = manager.Value("i", 0)
 
@@ -229,7 +229,9 @@ class SharedKeyframes:
 
         self.feat_dim = 1024
         self.num_patches = h * w // (16 * 16)
-
+        # 新增: 帧 ID 到索引的映射，用于快速查找 (line 233)
+        self.frame_id_to_index = {}
+        
         # fmt:off
         self.dataset_idx = torch.zeros(buffer, device=device, dtype=torch.int).share_memory_()
         self.img = torch.zeros(buffer, 3, h, w, device=device, dtype=dtype).share_memory_()
@@ -245,6 +247,9 @@ class SharedKeyframes:
         self.pos = torch.zeros(buffer, 1, self.num_patches, 2, device=device, dtype=torch.long).share_memory_()
         self.is_dirty = torch.zeros(buffer, 1, device=device, dtype=torch.bool).share_memory_()
         self.K = torch.zeros(3, 3, device=device, dtype=dtype).share_memory_()
+        # 新增: 版本控制用于同步 (line 251)
+        # 版本控制用于同步（每次修改时递增）
+        self.version = torch.zeros(buffer, device=device, dtype=torch.long).share_memory_()
         # fmt: on
 
     def __getitem__(self, idx) -> Frame:
@@ -271,6 +276,8 @@ class SharedKeyframes:
     def __setitem__(self, idx, value: Frame) -> None:
         with self.lock:
             self.n_size.value = max(idx + 1, self.n_size.value)
+            # 新增: 更新帧 ID 到索引的映射
+            self.frame_id_to_index[value.frame_id] = idx
 
             # set the attributes
             self.dataset_idx[idx] = value.frame_id

@@ -1,0 +1,25 @@
+inherit: "config/eval_no_calib.yaml"
+
+dataset:
+  subsample: 5  # Replica has 2000 frames, subsample for efficiency
+  img_downsample: 1
+  center_principle_point: False
+
+tracking:
+  min_match_frac: 0.05
+  max_iters: 50
+  pixel_border: -10
+  
+local_opt:
+  window_size: 1e+6
+  min_match_frac: 0.1
+  max_iters: 10
+  use_cuda: True
+
+retrieval:
+  k: 3
+  min_thresh: 5e-3
+
+reloc:
+  min_match_frac: 0.3
+  strict: False

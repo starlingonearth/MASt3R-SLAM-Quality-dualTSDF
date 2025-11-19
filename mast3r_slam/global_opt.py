@@ -26,6 +26,8 @@ class FactorGraph:
         self.window_size = self.cfg["window_size"]
 
         self.K = K
+        # 新增: 跟踪最后优化的关键帧索引用于 TSDF 集成 (line 29)
+        self.last_unique_kf_idx = None
 
     def add_factors(self, ii, jj, min_match_frac, is_reloc=False):
         kf_ii = [self.frames[idx] for idx in ii]
@@ -123,9 +125,13 @@ class FactorGraph:
         unique_kf_idx = self.get_unique_kf_idx()
         n_unique_kf = unique_kf_idx.numel()
         if n_unique_kf <= pin:
+            # 新增: 关键帧不足时重置 last_unique_kf_idx (line 127)
+            self.last_unique_kf_idx = None
             return
 
         Xs, T_WCs, Cs = self.get_poses_points(unique_kf_idx)
+        # 新增: 存储优化的关键帧索引用于 TSDF 集成 (line 131)
+        self.last_unique_kf_idx = unique_kf_idx.detach().cpu()
 
         ii, jj, idx_ii2jj, valid_match, Q_ii2jj = self.prep_two_way_edges()
 
@@ -163,9 +169,13 @@ class FactorGraph:
         unique_kf_idx = self.get_unique_kf_idx()
         n_unique_kf = unique_kf_idx.numel()
         if n_unique_kf <= pin:
+            # 新增: 关键帧不足时重置 last_unique_kf_idx (line 169)
+            self.last_unique_kf_idx = None
             return
 
         Xs, T_WCs, Cs = self.get_poses_points(unique_kf_idx)
+        # 新增: 存储优化的关键帧索引用于 TSDF 集成 (line 173)
+        self.last_unique_kf_idx = unique_kf_idx.detach().cpu()
 
         # Constrain points to ray
         img_size = self.frames[0].img.shape[-2:]

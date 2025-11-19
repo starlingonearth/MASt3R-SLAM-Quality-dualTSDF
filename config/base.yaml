@@ -56,3 +56,70 @@ retrieval:
 reloc:
   min_match_frac: 0.3
   strict: True
+  
+quality:
+  patch_size: 16
+  batch_size: 4
+  max_wait_ms: 10
+  metrics:
+    coverage:
+      alpha_ema: 0.8
+      b0: 0.15
+      theta0_deg: 10.0
+  thresholds:
+    z_r: 1.0
+    z_u: 1.0
+    d_cov: 0.02
+    
+tsdf_refine:
+  # Core settings
+  enabled: true
+  window_size: 5                    # Only refine recent 5 keyframes
+  
+  # Scheduling
+  quality_wait_ms: 500              # Wait for quality results
+  max_pending_tasks: 50             # Task queue size
+  
+  # TSDF construction (KinectFusion standard)
+  voxel_size: 0.02                  # 2cm voxel size
+  trunc_dist: 0.08                  # 8cm truncation distance
+  max_grid_dim: 64                  # Maximum grid dimension
+  roi_size: 0.4                     # 40cm ROI size
+  
+  # Surface extraction (Ray Casting)
+  ray_samples: 64                   # Samples per ray
+  max_displacement: 0.015           # 1.5cm max displacement
+  min_weight_threshold: 0.01        # Minimum TSDF weight
+  
+  # Conservative fusion (don't break tracking)
+  confidence_boost: 0.08            # Small confidence increase
+  confidence_max: 1.3               # Maximum confidence cap
+  min_hit_rate: 0.05                # 5% minimum hit rate to fuse
+  
+  # ROI selection
+  max_rois_per_kf: 3                # Maximum ROIs per keyframe
+  min_confidence: 0.2               # Minimum confidence threshold
+  
+  # Pose change detection
+  pose_stable_thresh: 0.01          # Detect backend pose updates
+  
+  # Shutdown
+  max_shutdown_wait_s: 60           # Maximum shutdown wait time
+  min_shutdown_wait_s: 2            # Minimum grace period
+
+tsdf_global:
+  enabled: false                    # Global TSDF disabled by default
+  voxel_size: 0.03                  # 3cm voxels for world-space volume
+  trunc_dist: 0.12                  # TSDF truncation distance (meters)
+  max_weight: 100.0                 # Clamp per-voxel fusion weight
+  min_tsdf_weight: 1.0e-3           # Threshold for considering a voxel valid
+  max_points_per_kf: 40000          # Subsampled points per keyframe integration
+  min_confidence: 0.05              # Ignore points with lower MASt3R confidence
+  samples_per_kf: 2000              # TSDF factor samples per keyframe
+  lambda: 0.15                      # Weight of TSDF residual in optimizer
+  max_iterations: 3                 # GN iterations for TSDF pose refinement
+  pre_icp_iters: 2                  # Optional ICP iterations before factor graph
+  damping: 1.0e-4                   # Levenberg damping for TSDF solve
+  queue_check_interval: 0.1         # Seconds between integration polls
+  reintegration_queue: 256          # Pending pose-update re-integration buffer
+  log_interval: 30                  # Seconds between status logs
